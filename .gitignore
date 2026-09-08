@@ -1,0 +1,33 @@
+# Jekyll
+_site/
+.sass-cache/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ROS bags (large binaries)
+*.db3
+*.db3-shm
+*.db3-wal
+bag_*/
+
+# Secrets
+*.pub
+k-gyaase*
+kojogyaase*
+1234
+y
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

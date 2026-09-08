@@ -275,30 +275,61 @@ ros2 bag play ~/f1tenth_runs/YYYYMM_DD_HHMMSS_explore/bag
 
 ## VNC Remote Desktop Access
 
-For remote monitoring via RViz2, use the provided connection script:
+The Jetson runs a headless GNOME desktop with a fake 1920×1080 display (EDID) and an `x11vnc` systemd service that starts automatically on boot. Connect via SSH tunnel:
 
 ```bash
 # On local machine:
 ./connect_f1prime_vnc.sh
 ```
 
-This script will:
-1. Start x11vnc on f1-prime (if not running)
-2. Create SSH tunnel: `localhost:5901 → f1-prime:5901`
-3. Launch Remmina with no-password profile
-4. Wait for Enter before disconnecting
+This script:
+1. Verifies `x11vnc` is running as a systemd service on f1-prime
+2. Creates SSH tunnel: `localhost:5900 → f1-prime:5900`
+3. Launches TigerVNC viewer (or Remmina fallback)
+4. You will be prompted for the VNC password (set via `x11vnc -storepasswd` on the Jetson)
 
-### Manual Setup
+### Manual VNC Connection
 
 ```bash
-# On f1-prime (one-time):
-nohup env XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:0 \
-  x11vnc -display :0 -nopw -listen localhost -forever -rfbport 5901 \
-  -noxdamage > /tmp/x11vnc.log 2>&1 < /dev/null &
+# On local machine — SSH tunnel
+ssh -L 5900:localhost:5900 f1-prime@192.168.1.209 -N
 
-# On local machine:
-ssh -L 5901:localhost:5901 f1-prime@192.168.1.209 -N
-# Then connect VNC viewer to localhost:5901
+# In another terminal — connect VNC viewer
+vncviewer localhost::5900
+# or: remmina -c ~/.config/remmina/f1prime_vnc.remmina
+```
+
+### Jetson Headless VNC Setup (One-Time)
+
+Based on [Mauro Arcidiacono's Jetson Headless VNC Guide](https://mauroarcidiacono.github.io/jetson-headless-vnc/):
+
+```bash
+# 1. Install x11vnc and set a VNC password
+ssh f1-prime@192.168.1.209
+sudo apt-get install x11vnc
+x11vnc -storepasswd
+
+# 2. Ensure graphical.target is active
+systemctl get-default   # should print "graphical.target"
+# If not: sudo systemctl set-default graphical.target
+
+# 3. Enable GDM auto-login (already configured on f1-prime)
+# Edit /etc/gdm3/custom.conf:
+#   [daemon]
+#   AutomaticLoginEnable=true
+#   AutomaticLogin=f1-prime
+
+# 4. Apply EDID fake display for 1920×1080
+# See f1tenth_system/f1tenth_stack/config/xorg.conf for the full xorg.conf
+# The EDID binary is at /lib/firmware/edid/EDID_1920x1080.bin
+
+# 5. Enable x11vnc systemd service
+sudo systemctl enable x11vnc.service
+sudo reboot
+
+# 6. Verify after reboot
+systemctl status x11vnc.service
+DISPLAY=:0 xrandr   # should show 1920x1080
 ```
 
 ---
@@ -347,7 +378,7 @@ map → odom → base_link → laser
 ### "Cannot connect to VNC server"
 
 - Ensure x11vnc is running: `ssh f1-prime "pgrep x11vnc"`
-- Ensure tunnel is up: `ss -tlnp | grep 5901`
+- Ensure tunnel is up: `ss -tlnp | grep 5900`
 - Try restarting: `./connect_f1prime_vnc.sh`
 
 ### "No odom->base_link TF"

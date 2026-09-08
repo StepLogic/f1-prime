@@ -1,0 +1,910 @@
+---
+layout: doc
+title: "F1TENTH Autonomous Exploration"
+description: >-
+  Nav2 and SLAM Toolbox driving a 1/10-scale Ackermann car through an unmapped
+  space — the build log, the calibrated values, and every fix the real run needed.
+permalink: /documentation/
+---
+<header class="mast">
+  <p class="kicker">
+    <span>ROS&nbsp;2 Humble</span><span class="sep">/</span>
+    <span>Nav2 1.1.20</span><span class="sep">/</span>
+    <span>F1TENTH · Jetson arm64</span>
+  </p>
+  <h1>Autonomous exploration on an F1TENTH car</h1>
+  <p class="standfirst">
+    A build log turned runbook: Nav2 and SLAM Toolbox driving a 1/10-scale
+    Ackermann car through a space it has never seen, with wheel odometry and the
+    VESC gyro fused into one transform. Every command here was run against a real
+    car, and every fix below is one that run actually needed.
+  </p>
+  <dl class="mast-meta">
+    <div><dt>Robot</dt><dd>f1-prime</dd></div>
+    <div><dt>Sensors</dt><dd>Hokuyo UST · VESC 6 IMU</dd></div>
+    <div><dt>Mapping</dt><dd>SLAM Toolbox, async</dd></div>
+    <div><dt>Verified</dt><dd>19 Aug 2026</dd></div>
+  </dl>
+</header>
+
+<section class="step" style="border-top:0">
+  <div class="num">—<small>OVERVIEW</small></div>
+  <div>
+    <h2>What this actually builds</h2>
+    <p>
+      The car drives itself around an unmapped space and comes back with a map.
+      Four things have to cooperate: SLAM Toolbox builds the map from laser scans,
+      an EKF keeps <code>odom&nbsp;→&nbsp;base_link</code> honest, Nav2 plans and
+      follows paths, and a frontier explorer keeps handing Nav2 somewhere new to go.
+    </p>
+
+    <div class="note">
+      <span class="lbl">Start with the official build guide</span>
+      <p>
+        This page picks up where the upstream documentation ends. It assumes you
+        have already built the car, flashed the VESC and installed the driver
+        stack by following
+        <a href="https://f1tenth.readthedocs.io/en/main/">the official RoboRacer
+        (formerly F1TENTH) documentation</a> — that is the complete,
+        step-by-step setup guide, and nothing here replaces it.
+      </p>
+      <p>
+        Note the rebrand: <code>f1tenth.org</code> now redirects to
+        <code>roboracer.ai</code>. The docs still live under the
+        <code>f1tenth.readthedocs.io</code> domain.
+      </p>
+    </div>
+
+    <div class="lede-grid">
+      <div class="card">
+        <h4>Frontier explorer</h4>
+        <p>Finds the boundary between mapped and unknown space, picks the nearest reachable one, sends it as a <code>NavigateToPose</code> goal.</p>
+      </div>
+      <div class="card">
+        <h4>SLAM Toolbox</h4>
+        <p>Owns <code>/map</code> and <code>map&nbsp;→&nbsp;odom</code>. No AMCL, no map_server — there is no prior map to localise against.</p>
+      </div>
+      <div class="card">
+        <h4>EKF fusion</h4>
+        <p>Wheel encoders give forward speed, the VESC gyro gives yaw rate. Together they beat either alone on an Ackermann chassis.</p>
+      </div>
+      <div class="card">
+        <h4>Ackermann bridge</h4>
+        <p>Nav2 speaks <code>Twist</code>; the car steers. A bicycle-model bridge converts, clamps, and acts as watchdog.</p>
+      </div>
+    </div>
+
+    <figure>
+      <div class="diagram">
+        <svg viewBox="0 0 880 400" role="img" aria-label="Data flow from sensors through SLAM, EKF and Nav2 to the VESC motor controller">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto">
+              <polygon points="0 0, 9 3.5, 0 7" fill="var(--ink-mid)"/>
+            </marker>
+            <marker id="aha" markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient="auto">
+              <polygon points="0 0, 9 3.5, 0 7" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- row 1: perception -->
+          <rect class="d-box" x="8" y="14" width="126" height="46" rx="5"/>
+          <text class="d-t" x="71" y="34" text-anchor="middle">Hokuyo LiDAR</text>
+          <text class="d-s" x="71" y="49" text-anchor="middle">192.168.0.10</text>
+
+          <line class="d-l" x1="134" y1="37" x2="228" y2="37" marker-end="url(#ah)"/>
+          <text class="d-s" x="181" y="30" text-anchor="middle">/scan</text>
+
+          <rect class="d-box-v" x="230" y="14" width="132" height="46" rx="5"/>
+          <text class="d-t" x="296" y="34" text-anchor="middle">SLAM Toolbox</text>
+          <text class="d-s" x="296" y="49" text-anchor="middle">async, 2 cm grid</text>
+
+          <line class="d-l" x1="362" y1="37" x2="470" y2="37" marker-end="url(#ah)"/>
+          <text class="d-s" x="416" y="30" text-anchor="middle">/map · map→odom</text>
+
+          <rect class="d-box-a" x="472" y="6" width="150" height="62" rx="5"/>
+          <text class="d-t" x="547" y="30" text-anchor="middle">Nav2</text>
+          <text class="d-s" x="547" y="45" text-anchor="middle">planner · controller</text>
+          <text class="d-s" x="547" y="58" text-anchor="middle">bt_navigator · costmaps</text>
+
+          <!-- explorer feeding nav2 -->
+          <rect class="d-box" x="676" y="6" width="150" height="62" rx="5"/>
+          <text class="d-t" x="751" y="30" text-anchor="middle">Frontier explorer</text>
+          <text class="d-s" x="751" y="47" text-anchor="middle">picks unknown edges</text>
+          <line class="d-l-a" x1="676" y1="37" x2="626" y2="37" marker-end="url(#aha)"/>
+          <text class="d-s" x="651" y="80" text-anchor="middle">NavigateToPose</text>
+
+          <!-- row 2: odometry -->
+          <rect class="d-box" x="8" y="132" width="126" height="60" rx="5"/>
+          <text class="d-t" x="71" y="155" text-anchor="middle">VESC</text>
+          <text class="d-s" x="71" y="170" text-anchor="middle">/dev/ttyACM0</text>
+          <text class="d-s" x="71" y="183" text-anchor="middle">motor · servo · IMU</text>
+
+          <line class="d-l" x1="134" y1="150" x2="228" y2="150" marker-end="url(#ah)"/>
+          <text class="d-s" x="181" y="143" text-anchor="middle">/sensors/imu/raw</text>
+          <line class="d-l" x1="134" y1="182" x2="228" y2="182" marker-end="url(#ah)"/>
+          <text class="d-s" x="181" y="196" text-anchor="middle">/odom</text>
+
+          <rect class="d-box-a" x="230" y="128" width="132" height="42" rx="5"/>
+          <text class="d-t" x="296" y="146" text-anchor="middle">IMU conditioner</text>
+          <text class="d-s" x="296" y="160" text-anchor="middle">units · frame · bias</text>
+
+          <line class="d-l" x1="362" y1="150" x2="432" y2="150" marker-end="url(#ah)"/>
+          <text class="d-s" x="397" y="143" text-anchor="middle">/imu/data</text>
+          <line class="d-l" x1="362" y1="182" x2="432" y2="168" marker-end="url(#ah)"/>
+
+          <rect class="d-box-v" x="434" y="126" width="126" height="52" rx="5"/>
+          <text class="d-t" x="497" y="148" text-anchor="middle">EKF</text>
+          <text class="d-s" x="497" y="164" text-anchor="middle">robot_localization</text>
+
+          <line class="d-l-a" x1="497" y1="126" x2="497" y2="70" marker-end="url(#aha)"/>
+          <text class="d-s" x="586" y="103" text-anchor="middle">odom → base_link TF</text>
+
+          <!-- row 3: control -->
+          <line class="d-l-a" x1="547" y1="68" x2="547" y2="236" marker-end="url(#aha)"/>
+          <text class="d-s" x="580" y="222" text-anchor="middle">/cmd_vel</text>
+
+          <rect class="d-box-a" x="452" y="238" width="190" height="46" rx="5"/>
+          <text class="d-t" x="547" y="258" text-anchor="middle">cmd_vel → Ackermann</text>
+          <text class="d-s" x="547" y="273" text-anchor="middle">bicycle model · clamp · watchdog</text>
+
+          <line class="d-l" x1="452" y1="261" x2="358" y2="261" marker-end="url(#ah)"/>
+          <text class="d-s" x="405" y="254" text-anchor="middle">/drive</text>
+
+          <rect class="d-box" x="222" y="238" width="134" height="46" rx="5"/>
+          <text class="d-t" x="289" y="258" text-anchor="middle">ackermann_mux</text>
+          <text class="d-s" x="289" y="273" text-anchor="middle">joystick wins</text>
+
+          <line class="d-l" x1="222" y1="261" x2="140" y2="261" marker-end="url(#ah)"/>
+          <text class="d-s" x="181" y="254" text-anchor="middle">/ackermann_cmd</text>
+
+          <rect class="d-box" x="8" y="238" width="130" height="46" rx="5"/>
+          <text class="d-t" x="73" y="258" text-anchor="middle">→ VESC</text>
+          <text class="d-s" x="73" y="273" text-anchor="middle">servo + eRPM</text>
+
+          <!-- joystick override -->
+          <rect class="d-box-v" x="222" y="318" width="134" height="42" rx="5"/>
+          <text class="d-t" x="289" y="336" text-anchor="middle">Joystick</text>
+          <text class="d-s" x="289" y="350" text-anchor="middle">priority 100 vs 10</text>
+          <line class="d-l-a" x1="289" y1="318" x2="289" y2="288" marker-end="url(#aha)"/>
+        </svg>
+      </div>
+      <figcaption>
+        Orange marks the paths that move the car or own a transform — the two
+        things worth watching when something goes wrong. The joystick enters the
+        same mux as Nav2 at ten times the priority, which is what makes it an e-stop.
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">01<small>PREFLIGHT</small></div>
+  <div>
+    <h2>Confirm what the car already has</h2>
+    <p>
+      Worth checking before installing anything — on the reference car, a directory
+      called <code>~/f1tenth_ws/src/Nav2</code> turned out to hold only YAML config.
+      Nav2 itself was never installed.
+    </p>
+<pre><code><span class="c"># the four support packages below ship as slam_toolbox dependencies —</span>
+<span class="c"># seeing them does NOT mean the navigation stack is present</span>
+ros2 pkg list | grep nav2
+<span class="c"># nav2_common  nav2_map_server  nav2_msgs  nav2_util   &lt;- not enough</span>
+
+ls /dev/sensors/          <span class="c"># expect: vesc -&gt; ../ttyACM0</span>
+ping -c3 192.168.0.10     <span class="c"># the LiDAR is on its own wired subnet</span>
+</code></pre>
+    <p>
+      A working stack needs <code>bt_navigator</code>, <code>controller_server</code>,
+      <code>planner_server</code>, <code>behavior_server</code>,
+      <code>lifecycle_manager</code> and <code>costmap_2d</code>. If those are missing,
+      nothing can navigate no matter how good the config is.
+    </p>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">02<small>INSTALL</small></div>
+  <div>
+    <h2>Install Nav2 and robot_localization</h2>
+<pre><code>sudo apt update
+sudo apt install -y ros-humble-navigation2 ros-humble-nav2-bringup \
+                    ros-humble-robot-localization
+
+<span class="c"># should now report ~30 packages</span>
+ros2 pkg list | grep -c nav2
+</code></pre>
+    <div class="note">
+      <span class="lbl">Humble renamed a server</span>
+      <p>
+        Config written for Galactic or earlier uses <code>recoveries_server</code>
+        with <code>nav2_recoveries/*</code> plugins. Humble calls it
+        <code>behavior_server</code> with <code>nav2_behaviors/*</code>. The old names
+        do not error — they simply never load, and you get a stack with no recovery
+        behaviours at all.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">03<small>TRANSPORT</small></div>
+  <div>
+    <h2>Fix DDS before you debug anything else</h2>
+    <p>
+      This step is unglamorous and it cost the most time. Two separate transport
+      faults each made costmaps silently fail to arrive, which looks exactly like a
+      Nav2 misconfiguration and is not one.
+    </p>
+
+    <h3>Stale shared-memory segments</h3>
+    <p>
+      If anything ever ran ROS as root, <code>/dev/shm</code> keeps root-owned
+      <code>fastrtps_*</code> files that your user cannot lock. The tell is
+      <code>open_and_lock_file failed</code> on startup.
+    </p>
+<pre><code>sudo rm -f /dev/shm/fastrtps_*    <span class="c"># with the stack stopped</span>
+</code></pre>
+
+    <h3>Foreign participants on a shared network</h3>
+    <p>
+      On a busy lab LAN, another machine's DDS traffic reaches this one and every
+      single node — including <code>static_transform_publisher</code>, which
+      subscribes to nothing — starts printing
+      <code>sequence size exceeds remaining buffer</code>. Large topics like the
+      costmaps never arrive at all.
+    </p>
+    <div class="note warn">
+      <span class="lbl">The diagnostic that matters</span>
+      <p>
+        If the error appears in nodes that have no business receiving big messages,
+        it is <em>discovery</em> traffic, not your payload. Chasing message size will
+        waste your afternoon — as it did here.
+      </p>
+    </div>
+<pre><code><span class="c"># everything runs on the car, so keep DDS on loopback and off domain 0</span>
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=1
+</code></pre>
+    <p>
+      <code>run_exploration.sh</code> sets both. The trade-off is that off-board
+      tools stop seeing topics, so run RViz on the car over <code>ssh -Y</code>.
+    </p>
+
+    <h3>Socket buffers</h3>
+    <p>
+      Costmaps exceed the 64&nbsp;kB UDP datagram limit and must fragment. Worth
+      raising regardless of the above:
+    </p>
+<pre><code>sudo tee /etc/sysctl.d/60-ros2-large-messages.conf &lt;&lt;'EOF'
+net.core.rmem_max=2147483647
+net.core.rmem_default=2147483647
+net.core.wmem_max=2147483647
+net.core.wmem_default=2147483647
+net.ipv4.ipfrag_time=3
+net.ipv4.ipfrag_high_thresh=134217728
+EOF
+sudo sysctl -p /etc/sysctl.d/60-ros2-large-messages.conf
+</code></pre>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">04<small>ODOMETRY</small></div>
+  <div>
+    <h2>Fuse the wheel odometry with the VESC gyro</h2>
+    <p>
+      <code>vesc_to_odom</code> derives heading by integrating the <em>commanded</em>
+      steering angle through a bicycle model. That is open loop: it knows nothing
+      about tyre slip, servo lag or steering trim, so yaw drifts badly. The VESC's
+      onboard gyro measures yaw rate directly. Fusing them gives SLAM Toolbox a much
+      steadier frame to scan-match against.
+    </p>
+
+    <h3>The raw IMU topic is not usable as published</h3>
+    <p>
+      <code>vesc_driver.cpp</code> copies packet fields into a
+      <code>sensor_msgs/Imu</code> verbatim. Three things break
+      <code>robot_localization</code>, and none of them announce themselves:
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Problem</th><th>As published</th><th>Consequence</th></tr></thead>
+        <tbody>
+          <tr><td>Empty frame</td><td><code>frame_id: ''</code></td><td>No TF lookup; every message dropped</td></tr>
+          <tr><td>Zero covariance</td><td>all <code>0.0</code></td><td>Read as infinite certainty; filter degenerates</td></tr>
+          <tr><td>Non-SI units</td><td>gyro °/s, accel g</td><td>Silently wrong by 57× and 9.8×</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The giveaway for units is that a stationary car reports
+      <code>linear_acceleration.z ≈ 1.01</code> — that is 1&nbsp;g, not 9.81&nbsp;m/s².
+      <code>vesc_imu_conditioner.py</code> fixes all three and republishes on
+      <code>/imu/data</code>, and also removes the gyro's zero-rate bias.
+    </p>
+    <div class="note">
+      <span class="lbl">Keep the car still at launch</span>
+      <p>
+        Bias is measured from the first 200 samples (~4&nbsp;s). Nothing is published
+        until that finishes, which usefully makes Nav2 wait rather than start on a
+        biased gyro. On the reference car the z-bias came out at 0.0057&nbsp;rad/s.
+      </p>
+    </div>
+
+    <h3>What gets fused</h3>
+    <p>
+      Only velocities, never absolute pose. In the odom frame the EKF is a
+      dead-reckoner; SLAM corrects accumulated drift through
+      <code>map&nbsp;→&nbsp;odom</code>.
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Source</th><th>Fused</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><code>/odom</code></td><td>forward velocity <code>vx</code></td><td>Wheel encoders measure speed well</td></tr>
+          <tr><td><code>/imu/data</code></td><td>yaw rate <code>vyaw</code></td><td>Gyro measures rotation well</td></tr>
+          <tr><td><code>/imu/data</code></td><td><em>orientation — excluded</em></td><td>Unreferenced AHRS; a jump would tear the map</td></tr>
+          <tr><td><code>/imu/data</code></td><td><em>accel — excluded</em></td><td>RC chassis vibration swamps the signal</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note danger">
+      <span class="lbl">One publisher per transform</span>
+      <p>
+        The EKF now owns <code>odom&nbsp;→&nbsp;base_link</code>, so
+        <code>vesc_to_odom</code> must stop broadcasting it. That is the single
+        change in <code>vesc_ekf.yaml</code> — <code>publish_tf: false</code>. Two
+        publishers on one transform makes TF non-deterministic and the map tears.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">05<small>KINEMATICS</small></div>
+  <div>
+    <h2>Teach Nav2 that the car cannot spin</h2>
+    <p>
+      Nav2 assumes a differential base unless told otherwise. An Ackermann car has
+      two hard constraints it will otherwise violate.
+    </p>
+    <h3>No rotation in place</h3>
+    <p>
+      <code>use_rotate_to_heading: false</code> is not optional. Left on, the
+      controller commands a pure spin the car physically cannot execute, and the
+      goal times out with the car sitting perfectly still. For the same reason the
+      behaviour tree uses <code>BackUp</code> and never <code>Spin</code>.
+    </p>
+    <h3>A footprint that matches the car</h3>
+    <p>
+      <code>base_link</code> sits at the <em>rear axle</em>, not the car's centre —
+      the LiDAR's static transform puts it 0.27&nbsp;m forward. A symmetric
+      <code>[±0.35, ±0.20]</code> box therefore claims 0.35&nbsp;m of car behind
+      the rear axle where none exists, and 0.20&nbsp;m half-width on a car whose
+      half-width is 0.15&nbsp;m. That inflates the inscribed radius by 5&nbsp;cm and
+      puts the footprint in permanent collision beside any wall. The corrected
+      box is <code>[[0.45, 0.15], [0.45, -0.15], [-0.12, -0.15], [-0.12, 0.15]]</code>.
+    </p>
+
+    <h3>A real minimum turning radius</h3>
+    <p>
+      Servo calibration gives the limit. From <code>vesc.yaml</code>,
+      <code>servo = -1.2135·δ + 0.5304</code> clamped to <code>[0.15, 0.85]</code>,
+      so usable steering is about −0.263 to +0.313&nbsp;rad. Taking 0.26&nbsp;rad as
+      the symmetric limit:
+    </p>
+<pre><code>R_min = wheelbase / tan(δ_max) = 0.25 / tan(0.26) ≈ <span class="p">0.94 m</span>
+</code></pre>
+    <div class="note warn">
+      <span class="lbl">A parameter that does nothing</span>
+      <p>
+        Humble's regulated pure pursuit controller has no
+        <code>min_turning_radius</code> parameter. Config inherited from older Nav2
+        often sets it, along with <code>max_linear_vel</code> and
+        <code>max_linear_accel</code>. Verify with
+        <code>ros2 param list /controller_server</code> — anything absent there is
+        being ignored, and any limit you think it enforces is not enforced.
+      </p>
+      <p>
+        The kinematic clamp therefore lives downstream in
+        <code>cmd_vel_to_ackermann.py</code>, where <code>max_steering_angle</code>
+        bounds steering for real.
+      </p>
+    </div>
+
+    <h3>The bridge does three jobs</h3>
+    <p>
+      It publishes continuously at 20&nbsp;Hz rather than only on each
+      <code>/cmd_vel</code>, which matters more than it sounds:
+    </p>
+    <ol>
+      <li><strong>Primes odometry.</strong> <code>vesc_to_odom</code> only emits <code>/odom</code> while servo commands flow. With <code>/drive</code> silent the transform vanishes and Nav2's costmaps come up blind — no TF means no scan raytracing, which means no obstacles, which means the car drives into walls.</li>
+      <li><strong>Feeds the mux.</strong> <code>ackermann_mux</code> drops any input silent for 0.2&nbsp;s.</li>
+      <li><strong>Acts as watchdog.</strong> If Nav2 stops publishing, commands go stale and the bridge commands zero. Without it the VESC holds the last speed forever and the car drives off on its own.</li>
+    </ol>
+
+    <h3>The motor has a minimum speed</h3>
+    <p>
+      A VESC will not start a sensorless motor at very low eRPM. On the reference
+      car Nav2 settled on 0.19&nbsp;m/s — about 880&nbsp;eRPM — and the VESC
+      reported <code>current_motor: -0.03&nbsp;A</code> with <code>speed: 0.0</code>
+      and <code>fault_code: 0</code>. The command was accepted, no current flowed,
+      and the car never moved. Nav2 then aborted on the progress checker, which
+      reads like a planning bug and is really a motor threshold.
+    </p>
+    <p>Two changes together fix it:</p>
+    <ul>
+      <li><code>use_cost_regulated_linear_velocity_scaling: false</code> — with 0.35&nbsp;m inflation indoors, cost is high nearly everywhere, and this was what dragged the request down to 0.19&nbsp;m/s. Curvature regulation stays on; that is the one an Ackermann car needs.</li>
+      <li><code>min_move_speed</code> in the bridge raises any non-zero request up to a speed the motor will actually start at. Zero stays exactly zero — a stop must never become motion.</li>
+    </ul>
+    <div class="note warn">
+      <span class="lbl">Calibrate, don't guess</span>
+      <p>
+        The threshold is per-car: it depends on motor, gearing, tyres and floor.
+        Run <code>speed_threshold.py</code> with only the hardware up — it ramps
+        the command in short bursts and reports the lowest speed that actually
+        turned the wheels. Feed that into <code>min_move_speed</code>,
+        <code>regulated_linear_scaling_min_speed</code> and
+        <code>min_approach_linear_velocity</code>. The defaults here (0.55&nbsp;m/s)
+        are a starting point, not a measurement.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">06<small>STEERING</small></div>
+  <div>
+    <h2>Trim the steering so zero means straight</h2>
+    <p>
+      With a zero steering command the car must run straight. If it arcs, the
+      commanded centre does not match the mechanical centre, and SLAM has to
+      absorb the error as heading drift. The knob is
+      <code>steering_angle_to_servo_offset</code> in the VESC config:
+    </p>
+<pre><code>servo = steering_angle_to_servo_gain * delta + steering_angle_to_servo_offset
+      = -1.2135 * delta + offset          <span class="c"># this car</span>
+</code></pre>
+    <p>
+      The offset is the servo value meaning <em>wheels straight</em>. It is a
+      mechanical property of the individual car and changes whenever the linkage,
+      servo horn or tie rods are touched, so the stock value is only a guess.
+    </p>
+
+    <div class="note">
+      <span class="lbl">Direction</span>
+      <p>
+        <strong>Higher offset steers RIGHT, lower steers LEFT.</strong> It follows
+        straight from the negative gain. Trust the equation: an attempt to derive
+        this empirically here produced the opposite answer and several wasted
+        iterations, because the measurements were taken while a servo cable was
+        intermittently seated.
+      </p>
+    </div>
+
+    <h3>The offset is bounded by the servo clamps</h3>
+    <p>
+      <code>servo_min</code> / <code>servo_max</code> bound the offset, because
+      full lock either way must still fit inside them:
+    </p>
+<pre><code>left  lock: offset - 1.2135 * delta_max &gt;= servo_min
+right lock: offset + 1.2135 * delta_max &lt;= servo_max
+
+<span class="c"># stock 0.15 / 0.85 with delta_max 0.26 rad gives:</span>
+0.4655 &lt;= offset &lt;= 0.5345
+</code></pre>
+    <div class="note danger">
+      <span class="lbl">Outside the window, a lock silently clamps</span>
+      <p>
+        Set the offset above the ceiling and full right lock is truncated; below
+        the floor and left lock goes. Nothing warns you — the car just loses
+        steering travel on one side. On the reference car an offset of 0.5420
+        clipped right lock exactly this way. Always compute both locks after
+        changing the offset.
+      </p>
+    </div>
+
+    <h3>Procedure</h3>
+    <ol>
+      <li>Clear a straight run of about 3&nbsp;m. Shorter is not enough: over 0.25&nbsp;m a 4° error moves the nose only ~2&nbsp;cm, which is lost in tyre scrub.</li>
+      <li><code>safe_drive.sh 0.4 2.0</code> — drives with steering commanded to exactly 0, and refuses to run if there is not room.</li>
+      <li>Watch which way it arcs. Veers left → raise the offset; veers right → lower it.</li>
+      <li><code>set_offset.sh &lt;value&gt;</code> and repeat. The driver reads the offset once at startup, so this restarts it; <code>ros2 param set</code> alone would report the new value while the car kept behaving the old way.</li>
+    </ol>
+    <p>
+      For a number rather than an eyeball call, <code>steering_trim.py</code> reads
+      the conditioned gyro and inverts the bicycle model,
+      <code>delta_err = atan(wheelbase * yaw_rate / speed)</code>. It needs only
+      ~1&nbsp;m per pass. It refuses to fall back to <code>/odom</code>, whose yaw
+      rate is derived from the servo <em>command</em> — measuring trim from that is
+      circular.
+    </p>
+
+    <h3>When the offset cannot reach</h3>
+    <p>
+      If the car still veers at the window's edge, the clamps are the limit, not
+      the servo. <code>servo_min</code> / <code>servo_max</code> are conservative
+      software values; most servos travel further.
+      <code>servo_limit_test.sh high</code> steps the commanded position outward
+      in increments so you can see where the wheels actually stop.
+    </p>
+    <div class="note warn">
+      <span class="lbl">Do not park on a stalled servo</span>
+      <p>
+        Past its mechanical stop the servo stalls, drawing current continuously
+        until it overheats — and <code>temp_motor</code> reads 0.0 on this VESC,
+        so nothing warns you. Widen the clamps only as far as the measured travel,
+        then back off a little.
+      </p>
+    </div>
+    <p>
+      The reference car ended at <strong>offset 0.58</strong> with
+      <code>servo_max</code> raised to <strong>0.90</strong> (full right lock needs
+      0.8955). That is 4.4° of right bias past stock — a large trim, and a sign the
+      linkage itself is off true. Correcting it mechanically, at the servo horn or
+      tie rod, gives the range back and costs no steering travel.
+    </p>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">07<small>LIDAR</small></div>
+  <div>
+    <h2>Rule out a LiDAR self-hit — properly</h2>
+    <p>
+      If the LiDAR can see part of the car, that hardware is marked as an obstacle
+      that travels with the robot, painting a trail it can never escape. It is worth
+      checking. It is also very easy to diagnose wrongly, so the method matters more
+      than the check.
+    </p>
+    <div class="note danger">
+      <span class="lbl">Test on open floor, never in a tight spot</span>
+      <p>
+        With the car boxed in, on-car hardware and the surrounding walls are
+        indistinguishable — both sit close and both stay put. On this car that
+        produced a confident, wrong diagnosis: close returns at +95°…+135° persisted
+        across a 139° rotation, which looked conclusive and was coincidence. The car
+        had walls on several sides in both positions.
+      </p>
+      <p>
+        Move the car to open floor with at least a metre clear all round. There,
+        anything still returning under ~0.8&nbsp;m is on the car by definition.
+      </p>
+    </div>
+<pre><code><span class="c"># stock sensors config — you need the FULL 270 deg view for this test</span>
+ros2 launch f1tenth_stack bringup_launch.py \
+    vesc_config:=~/f1tenth_exploration/vesc_ekf.yaml
+python3 ~/f1tenth_exploration/mount_probe.py
+</code></pre>
+    <p>
+      <code>mount_probe.py</code> converts every close return into
+      <code>base_link</code> coordinates and clusters them, so it names the location
+      of anything it finds. On the reference car the verdict was
+      <em>"No returns under 0.35&nbsp;m — nothing near the sensor"</em>: no self-hit,
+      and no masking needed.
+    </p>
+    <div class="note warn">
+      <span class="lbl">Masking hides real obstacles</span>
+      <p>
+        Trimming <code>angle_max</code> does silence
+        <code>detected collision ahead!</code> — but it silences it just as
+        effectively when the obstacle is a genuine wall. Nav2 then drives into the
+        sector it can no longer see. Masking is a last resort <em>after</em>
+        <code>mount_probe.py</code> has positively identified on-car hardware on open
+        floor; the real fix is remounting the LiDAR above the obstruction. When the
+        test comes back clean, as it did here, suspect the footprint and inflation
+        instead.
+      </p>
+    </div>
+    <p>
+      For reference, this car's mount is <code>base_link → laser = (0.27, 0.00, 0.11)</code>
+      with identity rotation, hardcoded in <code>bringup_launch.py</code> — there is no
+      URDF in the workspace. At 11&nbsp;cm the scan plane is low enough to clip a tall
+      Jetson or battery on other builds, so the test is worth running on any new car.
+    </p>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">08<small>LAUNCH</small></div>
+  <div>
+    <h2>Bring it up</h2>
+<pre><code>cd ~/f1tenth_exploration
+
+./run_exploration.sh --no-drive   <span class="c"># stack only, car stays put</span>
+./run_exploration.sh              <span class="c"># full autonomous run</span>
+./run_exploration.sh --kill       <span class="c"># stop, leaving the car stopped</span>
+
+tmux attach -t explore            <span class="c"># bringup · stack · explorer · record</span>
+</code></pre>
+    <div class="note danger">
+      <span class="lbl">Before the car moves</span>
+      <p>
+        Flat enclosed area. No stairs, drop-offs, cables to snag or anything
+        fragile within reach. Stay with the car and hold the joystick — its mux
+        priority of 100 against Nav2's 10 means the deadman button overrides
+        Nav2 completely, and that is your only e-stop.
+      </p>
+      <p>
+        Speed is capped independently in two places:
+        <code>desired_linear_vel</code> (0.5&nbsp;m/s) in <code>nav2_params.yaml</code>
+        and <code>max_speed</code> (0.6&nbsp;m/s) in the bridge. Lower both to slow
+        the car; lowering one alone is not a cap.
+      </p>
+    </div>
+    <p>Always run <code>--no-drive</code> first on a stack you have changed, and only start the explorer once the checks below pass.</p>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">09<small>VERIFY</small></div>
+  <div>
+    <h2>Check it before you let it drive</h2>
+    <p>These are the exact checks used on the reference car, with the values it returned.</p>
+<pre><code>export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=1
+source /opt/ros/humble/setup.bash
+source ~/f1tenth_ws/install/setup.bash
+
+<span class="c"># 1. every Nav2 server must report: active [3]</span>
+for n in controller_server planner_server behavior_server \
+         bt_navigator waypoint_follower; do
+  printf <span class="s">"%-20s "</span> $n; ros2 lifecycle get /$n
+done
+
+<span class="c"># 2. the transform chain must be unbroken</span>
+python3 wait_for_tf.py map base_link 10
+
+<span class="c"># 3. sensors and fusion</span>
+ros2 topic hz /scan               <span class="c"># ~40 Hz</span>
+ros2 topic hz /imu/data           <span class="c"># ~60 Hz</span>
+ros2 topic hz /odometry/filtered  <span class="c"># ~42 Hz</span>
+</code></pre>
+    <div class="note">
+      <span class="lbl">Check costmaps with a subscriber, not the CLI</span>
+      <p>
+        <code>ros2 topic hz</code> on an <code>OccupancyGrid</code> reports
+        <code>sequence size exceeds remaining buffer</code> even when the topic is
+        perfectly healthy. Subscribe and count cells instead — a local costmap
+        reading 0% occupied while the car sits in a room is the blind-costmap
+        failure, and it is the one that drives into walls.
+      </p>
+    </div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Check</th><th>Healthy value</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td><code>/map</code></td><td>271×186 @ 0.02 m, ~82% unknown at start</td><td><span class="pill ok">verified</span></td></tr>
+          <tr><td><code>/global_costmap/costmap</code></td><td>unknown shrinking, ~23% occupied</td><td><span class="pill ok">verified</span></td></tr>
+          <tr><td><code>/local_costmap/costmap</code></td><td>300×300, ~11% occupied</td><td><span class="pill ok">verified</span></td></tr>
+          <tr><td>Nav2 lifecycle</td><td>all five <code>active [3]</code></td><td><span class="pill ok">verified</span></td></tr>
+          <tr><td>TF <code>map→base_link</code></td><td>resolves</td><td><span class="pill ok">verified</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">10<small>MAP</small></div>
+  <div>
+    <h2>Save the map</h2>
+    <p>The explorer stops on its own once no reachable frontier remains. Save before tearing anything down — the map lives only in SLAM Toolbox's memory.</p>
+<pre><code>mkdir -p ~/maps
+ros2 run nav2_map_server map_saver_cli -f ~/maps/explored_map
+<span class="c"># writes explored_map.pgm + explored_map.yaml</span>
+</code></pre>
+    <p>
+      To navigate that map later rather than rebuild it, swap SLAM Toolbox for
+      <code>map_server</code> plus AMCL — and set AMCL's
+      <code>robot_model_type</code> appropriately for a steered chassis.
+    </p>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">11<small>DEBUG</small></div>
+  <div>
+    <h2>When it misbehaves</h2>
+    <div class="note">
+      <span class="lbl">Trace the chain, do not guess</span>
+      <p>
+        Most of the hard faults here were found by walking the command path one
+        stage at a time and asking what each stage <em>proves</em>. When the
+        steering died, <code>/commands/servo/position</code> carried exactly the
+        right values — but that is the topic the driver SUBSCRIBES to, so it
+        proved nothing about the VESC. Reading <code>/sensors/core</code> back
+        (live telemetry, <code>fault_code: 0</code>) proved the serial link worked
+        in both directions, which placed the fault downstream of the VESC and led
+        straight to an unseated servo cable. Check what a signal actually
+        demonstrates before concluding from it.
+      </p>
+    </div>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Every node prints <code>sequence size exceeds remaining buffer</code></td>
+            <td>Foreign DDS participant on a shared LAN</td>
+            <td><code>ROS_LOCALHOST_ONLY=1</code>, non-zero <code>ROS_DOMAIN_ID</code></td>
+          </tr>
+          <tr>
+            <td><code>open_and_lock_file failed</code></td>
+            <td>Root-owned <code>/dev/shm/fastrtps_*</code></td>
+            <td><code>sudo rm -f /dev/shm/fastrtps_*</code> while stopped</td>
+          </tr>
+          <tr>
+            <td><code>bt_navigator</code> won't configure, <code>ID [X] already registered</code></td>
+            <td>Duplicate entry in <code>plugin_lib_names</code></td>
+            <td>De-duplicate the list</td>
+          </tr>
+          <tr>
+            <td>Car sits still, goal eventually times out</td>
+            <td><code>use_rotate_to_heading: true</code> — it cannot spin</td>
+            <td>Set it <code>false</code></td>
+          </tr>
+          <tr>
+            <td>Drives into walls; costmaps show no obstacles</td>
+            <td>Costmaps started without <code>odom→base_link</code></td>
+            <td>Keep <code>/drive</code> flowing from launch; wait on the TF</td>
+          </tr>
+          <tr>
+            <td>Heading drifts, map smears on turns</td>
+            <td>Gyro bias, or the EKF never got the IMU</td>
+            <td>Car still at launch; confirm <code>/imu/data</code> publishes</td>
+          </tr>
+          <tr>
+            <td>Map tears or jitters</td>
+            <td>Two publishers of <code>odom→base_link</code></td>
+            <td><code>publish_tf: false</code> in <code>vesc_ekf.yaml</code></td>
+          </tr>
+          <tr>
+            <td>Car keeps driving after Ctrl-C</td>
+            <td>VESC holds the last commanded speed</td>
+            <td><code>--kill</code>, which publishes an explicit zero</td>
+          </tr>
+          <tr>
+            <td><code>ros2 lifecycle get</code> says <em>Node not found</em> but the process runs</td>
+            <td>Stale CLI daemon after a domain change</td>
+            <td><code>ros2 daemon stop</code>, then retry</td>
+          </tr>
+          <tr>
+            <td>Servo silent, but commands look perfect all the way down the chain</td>
+            <td>Servo cable unseated — or its power/BEC missing</td>
+            <td>Reseat at the VESC servo header; check 5&nbsp;V on that header</td>
+          </tr>
+          <tr>
+            <td><code>/dev/sensors/vesc</code> vanishes mid-session; nothing responds</td>
+            <td>VESC USB cable worked loose (driving, impacts)</td>
+            <td><code>dmesg | grep "USB disconnect"</code> to confirm; reseat and secure both cables</td>
+          </tr>
+          <tr>
+            <td>Car arcs with a zero steering command</td>
+            <td>Steering trim off</td>
+            <td>Raise the offset if it veers left, lower if right; keep both locks inside the servo clamps</td>
+          </tr>
+          <tr>
+            <td>One steering lock is visibly shorter than the other</td>
+            <td>Offset outside the clamp window, so that lock truncates</td>
+            <td>Recompute both locks; widen <code>servo_max</code> only to measured travel</td>
+          </tr>
+          <tr>
+            <td>Blocked in every direction; <code>BackUp</code> also reports collision</td>
+            <td>Usually a real obstacle plus an oversized footprint — not a self-hit</td>
+            <td><code>space_probe.py</code> for clearance; verify the footprint; only then <code>mount_probe.py</code> on open floor</td>
+          </tr>
+          <tr>
+            <td>VESC commanded but <code>current_motor</code> ≈ 0 and car still</td>
+            <td>Commanded speed below the motor's starting eRPM</td>
+            <td>Calibrate with <code>speed_threshold.py</code>, set <code>min_move_speed</code></td>
+          </tr>
+          <tr>
+            <td>No <code>/odom</code> at all</td>
+            <td><code>vesc_to_odom</code> needs servo commands first</td>
+            <td>Bridge must publish from startup</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <details>
+      <summary>Files in <code>~/f1tenth_exploration</code></summary>
+      <div class="body">
+        <div class="tw">
+          <table>
+            <thead><tr><th>File</th><th>Role</th></tr></thead>
+            <tbody>
+              <tr><td><code>run_exploration.sh</code></td><td>tmux launcher; sets DDS env, four windows</td></tr>
+              <tr><td><code>exploration_launch.py</code></td><td>SLAM + EKF + Nav2 + bridges</td></tr>
+              <tr><td><code>nav2_params.yaml</code></td><td>Nav2 config, Humble names, Ackermann limits</td></tr>
+              <tr><td><code>slam_params.yaml</code></td><td>async SLAM Toolbox, 2 cm resolution</td></tr>
+              <tr><td><code>ekf.yaml</code></td><td>robot_localization: vx from wheels, vyaw from gyro</td></tr>
+              <tr><td><code>vesc_ekf.yaml</code></td><td>stock vesc.yaml with <code>publish_tf: false</code></td></tr>
+              <tr><td><code>vesc_imu_conditioner.py</code></td><td>units, frame, covariance, gyro bias</td></tr>
+              <tr><td><code>cmd_vel_to_ackermann.py</code></td><td>bicycle model, clamp, watchdog, odom prime</td></tr>
+              <tr><td><code>frontier_explorer.py</code></td><td>frontier detection and goal dispatch</td></tr>
+              <tr><td><code>exploration_bt.xml</code></td><td>behaviour tree: replan at 1 Hz, BackUp not Spin</td></tr>
+              <tr><td><code>mount_probe.py</code></td><td>locates close returns in base_link; rules a self-hit in or out</td></tr>
+              <tr><td><code>safe_drive.sh</code></td><td>straight drive that REFUSES to run without clearance</td></tr>
+              <tr><td><code>set_offset.sh</code></td><td>sets the steering trim and restarts the driver</td></tr>
+              <tr><td><code>sweep_steering.sh</code></td><td>left/right sweep, car stationary, prints servo values</td></tr>
+              <tr><td><code>hold_centre.sh</code></td><td>holds the servo at centre while you adjust the linkage</td></tr>
+              <tr><td><code>servo_limit_test.sh</code></td><td>finds the servo's real travel beyond the config clamps</td></tr>
+              <tr><td><code>steering_trim.py</code></td><td>gyro-based trim measurement in radians</td></tr>
+              <tr><td><code>map_recorder.py</code></td><td>PNG frames of map + costmaps for a run video</td></tr>
+              <tr><td><code>speed_threshold.py</code></td><td>finds the lowest speed that actually moves the car</td></tr>
+              <tr><td><code>map_snapshot.py</code></td><td>PNGs of map, both costmaps, and a polar scan plot</td></tr>
+              <tr><td><code>space_probe.py</code></td><td>clearance per sector and cost under the footprint</td></tr>
+              <tr><td><code>wait_for_tf.py</code></td><td>blocks until a transform exists</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+  </div>
+</section>
+
+<section class="step">
+  <div class="num">—<small>REFERENCES</small></div>
+  <div>
+    <h2>Upstream documentation</h2>
+    <p>
+      Everything on this page sits on top of the official stack. Use these for
+      the build itself, and treat this guide as the layer above them.
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Source</th><th>Covers</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><a href="https://f1tenth.readthedocs.io/en/main/">RoboRacer / F1TENTH documentation</a></td>
+            <td><strong>The full setup guide.</strong> Start here — building the car, system configuration, driver stack, and first autonomous control</td>
+          </tr>
+          <tr>
+            <td><a href="https://f1tenth.readthedocs.io/en/main/getting_started/build_car/index.html">Build the car</a></td>
+            <td>Chassis, power, compute and sensor assembly on the Traxxas platform</td>
+          </tr>
+          <tr>
+            <td><a href="https://f1tenth.readthedocs.io/en/main/getting_started/firmware/index.html">Firmware &amp; system configuration</a></td>
+            <td>VESC flashing and calibration, udev rules, host setup — the values this guide then trims</td>
+          </tr>
+          <tr>
+            <td><a href="https://f1tenth.readthedocs.io/en/main/getting_started/driving/index.html">Driver stack &amp; joystick</a></td>
+            <td>Installing <code>f1tenth_system</code> and driving under manual control</td>
+          </tr>
+          <tr>
+            <td><a href="https://f1tenth.readthedocs.io/en/main/getting_started/driving/drive_autonomous.html">Autonomous control</a></td>
+            <td>Publishing to <code>/drive</code> through the mux and the deadman switch</td>
+          </tr>
+          <tr>
+            <td><a href="https://github.com/f1tenth/f1tenth_system">f1tenth/f1tenth_system</a></td>
+            <td>Source for <code>vesc_driver</code>, <code>vesc_to_odom</code>, <code>ackermann_mux</code> — worth reading when a topic does not behave as documented</td>
+          </tr>
+          <tr>
+            <td><a href="https://docs.nav2.org/">Nav2 documentation</a></td>
+            <td>Parameter reference for every plugin configured here; check it before assuming a parameter exists</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      <span class="lbl">Verify parameters against your Nav2 version</span>
+      <p>
+        Config copied between Nav2 releases fails silently. Humble's regulated
+        pure pursuit has no <code>min_turning_radius</code>, and its recovery
+        server is <code>behavior_server</code>, not <code>recoveries_server</code>
+        — in both cases the stale setting loads without error and simply does
+        nothing. <code>ros2 param list /controller_server</code> is the arbiter.
+      </p>
+    </div>
+  </div>
+</section>
+
+<hr class="end">
+<p class="foot">
+  Verified against f1-prime — Jetson arm64, Ubuntu 22.04, ROS 2 Humble,
+  Nav2 1.1.20 — on 19 August 2026. Values quoted throughout are measured from
+  that car, not from documentation.
+</p>

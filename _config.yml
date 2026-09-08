@@ -1,0 +1,50 @@
+title: "F1-Prime: Autonomous Exploration"
+description: >-
+  F1Tenth autonomous racing platform documentation — frontier-based exploration
+  with SLAM Toolbox, Nav2, and ROS 2 Galactic on NVIDIA Jetson Orin Nano.
+# Project page at https://steplogic.github.io/f1-prime/ — baseurl must be the
+# repo name or every relative_url (stylesheets, page links) 404s.
+# The Pages workflow re-injects these, so a repo rename stays correct.
+baseurl: "/f1-prime"
+url: "https://steplogic.github.io"
+
+theme: jekyll-theme-cayman
+
+plugins:
+  - jekyll-relative-links
+
+# index.md is the site index, so README promotion is not wanted — and it
+# misfires on the documentation collection, claiming /documentation/index.html.
+readme_index:
+  enabled: false
+
+# The illustrated guide lives in _documentation/ and is served as a Jekyll
+# collection, so its assets keep their relative paths under /documentation/.
+collections:
+  documentation:
+    output: true
+
+include:
+  - README.md
+  - STUDENT_REPLICATION_GUIDE.md
+  - HALLWAY_EXPLORATION.md
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor/
+  - "*.pyc"
+  - __pycache__/
+  - bag_*/
+  - "*.db3"
+  - "*.db3-shm"
+  - "*.db3-wal"
+  - fastrlap_setup/
+  - .claude/
+  - "*.pub"
+  - "k-gyaase*"
+  - "kojogyaase*"
+  - .github/
+  # private keys that must never reach the built site
+  - "1234"
+  - "y"
